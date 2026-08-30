@@ -1,29 +1,33 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from anndata import AnnData, read_text
+from anndata import AnnData
+from anndata.io import read_text
 from h5py import File
 from PIL import Image
 from scanpy import read_10x_h5, read_10x_mtx
 
 from squidpy._constants._pkg_constants import Key
 from squidpy._utils import NDArrayA
-from squidpy.datasets._utils import PathLike
+
+# Type alias for path-like objects
+type PathLike = os.PathLike[str] | str
 
 
 def _read_counts(
     path: str | Path,
-    count_file: str,
+    counts_file: str,
     library_id: str | None = None,
     **kwargs: Any,
 ) -> tuple[AnnData, str]:
     path = Path(path)
-    if count_file.endswith(".h5"):
-        adata: AnnData = read_10x_h5(path / count_file, **kwargs)
-        with File(path / count_file, mode="r") as f:
+    if counts_file.endswith(".h5"):
+        adata: AnnData = read_10x_h5(path / counts_file, **kwargs)
+        with File(path / counts_file, mode="r") as f:
             attrs = dict(f.attrs)
             if library_id is None:
                 try:
@@ -46,9 +50,9 @@ def _read_counts(
     if library_id is None:
         raise ValueError("Please explicitly specify library id.")
 
-    if count_file.endswith((".csv", ".txt")):
-        adata = read_text(path / count_file, **kwargs)
-    elif count_file.endswith(".mtx.gz"):
+    if counts_file.endswith((".csv", ".txt")):
+        adata = read_text(path / counts_file, **kwargs)
+    elif counts_file.endswith(".mtx.gz"):
         adata = read_10x_mtx(path, **kwargs)
     else:
         raise NotImplementedError("TODO")

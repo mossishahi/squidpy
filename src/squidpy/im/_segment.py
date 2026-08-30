@@ -160,7 +160,7 @@ class SegmentationModel(ABC):
         if isinstance(library_id, str):
             func = {library_id: self.segment}
         elif isinstance(library_id, Sequence):
-            func = {lid: self.segment for lid in library_id}
+            func = dict.fromkeys(library_id, self.segment)
         else:
             raise TypeError(
                 f"Expected library id to be `None` or of type `str` or `sequence`, found `{type(library_id).__name__}`."
@@ -248,7 +248,7 @@ class SegmentationCustom(SegmentationModel):
     func
         Segmentation function to use. Can be any :func:`callable`, as long as it has the following signature:
         :class:`numpy.ndarray` ``(height, width, channels)`` **->** :class:`numpy.ndarray` ``(height, width[, 1])``.
-        The segmentation must be of :class:`numpy.uint32` type, where 0 marks background.
+        The segmentation must be of :attr:`numpy.uint32` type, where 0 marks background.
     """
 
     def __init__(self, func: Callable[..., NDArrayA]):

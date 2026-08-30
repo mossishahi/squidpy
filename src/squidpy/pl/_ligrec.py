@@ -41,8 +41,9 @@ class CustomDotplot(sc.pl.DotPlot):
     def _plot_size_legend(self, size_legend_ax: Axes) -> None:
         y = self.BASE ** -((self.dot_max * self._delta) + self._minn)
         x = self.BASE ** -((self.dot_min * self._delta) + self._minn)
-        size_range = -(np.logspace(x, y, self.DEFAULT_NUM_LEGEND_DOTS + 1, base=10).astype(np.float64))
-        size_range = (size_range - np.min(size_range)) / (np.max(size_range) - np.min(size_range))
+        size_range = -np.logspace(x, y, self.DEFAULT_NUM_LEGEND_DOTS + 1, base=10, dtype=np.float64)
+        size_range = ((size_range - np.min(size_range)) / (np.max(size_range) - np.min(size_range))).astype(np.float64)
+
         # no point in showing dot of size 0
         size_range = size_range[1:]
 
@@ -159,7 +160,7 @@ def ligrec(
     %(adata)s
         It can also be a :class:`dict`, as returned by :func:`squidpy.gr.ligrec`.
     %(cluster_key)s
-        Only used when ``adata`` is of type :class:`AnnData`.
+        Only used when ``adata`` is of type :class:`~anndata.AnnData`.
     source_groups
         Source interaction clusters. If `None`, select all clusters.
     target_groups

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Literal
 
 import numpy as np
@@ -8,19 +8,20 @@ import pandas as pd
 from anndata import AnnData
 from numba import njit
 from scanpy import logging as logg
-from scipy.sparse import csr_matrix, issparse, isspmatrix_csr, spmatrix
+from scipy.sparse import csc_matrix, csr_matrix, issparse, isspmatrix_csr, spmatrix
 from sklearn.metrics import pairwise_distances
 from spatialdata import SpatialData
 
 from squidpy._constants._pkg_constants import Key
 from squidpy._docs import d, inject_docs
-from squidpy._utils import NDArrayA, Signal, SigQueue, _get_n_cores, parallelize
+from squidpy._utils import NDArrayA, deprecated_params, get_n_numba_threads, thread_map
+from squidpy._validators import assert_non_empty_sequence
 from squidpy.gr._utils import (
     _assert_connectivity_key,
-    _assert_non_empty_sequence,
     _assert_spatial_basis,
     _extract_expression,
     _save_data,
+    extract_adata_if_sdata,
 )
 
 __all__ = ["sepal"]
@@ -28,6 +29,7 @@ __all__ = ["sepal"]
 
 @d.dedent
 @inject_docs(key=Key.obsp.spatial_conn())
+@deprecated_params({"backend": "1.10.0"})
 def sepal(
     adata: AnnData | SpatialData,
     max_neighs: Literal[4, 6],
@@ -41,8 +43,9 @@ def sepal(
     use_raw: bool = False,
     copy: bool = False,
     n_jobs: int | None = None,
-    backend: str = "loky",
     show_progress_bar: bool = True,
+    *,
+    table_key: str | None = None,
 ) -> pd.DataFrame | None:
     """
     Identify spatially variable genes with *Sepal*.
@@ -53,6 +56,7 @@ def sepal(
     Parameters
     ----------
     %(adata)s
+    %(table_key)s
     max_neighs
         Maximum number of neighbors of a node in the graph. Valid options are:
 
@@ -78,8 +82,8 @@ def sepal(
     use_raw
         Whether to access :attr:`anndata.AnnData.raw`.
     %(copy)s
-    %(parallelize)s
-
+    %(n_jobs_threads)s
+    %(show_progress_bar)s
     Returns
     -------
     If ``copy = True``, returns a :class:`pandas.DataFrame` with the sepal scores.
@@ -93,8 +97,7 @@ def sepal(
     If some genes in :attr:`anndata.AnnData.uns` ``['sepal_score']`` are `NaN`,
     consider re-running the function with increased ``n_iter``.
     """
-    if isinstance(adata, SpatialData):
-        adata = adata.table
+    adata = extract_adata_if_sdata(adata, table_key=table_key)
     _assert_connectivity_key(adata, connectivity_key)
     _assert_spatial_basis(adata, key=spatial_key)
     if max_neighs not in (4, 6):
@@ -106,9 +109,9 @@ def sepal(
         genes = adata.var_names.values
         if "highly_variable" in adata.var.columns:
             genes = genes[adata.var["highly_variable"].values]
-    genes = _assert_non_empty_sequence(genes, name="genes")
+    genes = assert_non_empty_sequence(genes, name="genes")
 
-    n_jobs = _get_n_cores(n_jobs)
+    n_jobs = get_n_numba_threads(n_jobs)
 
     g = adata.obsp[connectivity_key]
     if not isspmatrix_csr(g):
@@ -124,26 +127,24 @@ def sepal(
 
     # get counts
     vals, genes = _extract_expression(adata, genes=genes, use_raw=use_raw, layer=layer)
-    start = logg.info(f"Calculating sepal score for `{len(genes)}` genes using `{n_jobs}` core(s)")
+    start = logg.info(f"Calculating sepal score for `{len(genes)}` genes using `{n_jobs}` thread(s)")
 
-    score = parallelize(
-        _score_helper,
-        collection=np.arange(len(genes)).tolist(),
-        extractor=np.hstack,
-        use_ixs=False,
+    use_hex = max_neighs == 6
+
+    if issparse(vals):
+        vals = csc_matrix(vals)
+    score = _diffusion_genes(
+        vals,
+        use_hex,
+        n_iter,
+        sat,
+        sat_idx,
+        unsat,
+        unsat_idx,
+        dt,
+        thresh,
         n_jobs=n_jobs,
-        backend=backend,
         show_progress_bar=show_progress_bar,
-    )(
-        vals=vals,
-        max_neighs=max_neighs,
-        n_iter=n_iter,
-        sat=sat,
-        sat_idx=sat_idx,
-        unsat=unsat,
-        unsat_idx=unsat_idx,
-        dt=dt,
-        thresh=thresh,
     )
 
     key_added = "sepal_score"
@@ -160,10 +161,9 @@ def sepal(
     _save_data(adata, attr="uns", key=key_added, data=sepal_score, time=start)
 
 
-def _score_helper(
-    ixs: Sequence[int],
-    vals: spmatrix | NDArrayA,
-    max_neighs: int,
+def _diffusion_genes(
+    vals: NDArrayA | spmatrix,
+    use_hex: bool,
     n_iter: int,
     sat: NDArrayA,
     sat_idx: NDArrayA,
@@ -171,60 +171,71 @@ def _score_helper(
     unsat_idx: NDArrayA,
     dt: float,
     thresh: float,
-    queue: SigQueue | None = None,
+    n_jobs: int,
+    show_progress_bar: bool = True,
 ) -> NDArrayA:
-    if max_neighs == 4:
-        fun = _laplacian_rect
-    elif max_neighs == 6:
-        fun = _laplacian_hex
-    else:
-        raise NotImplementedError(f"Laplacian for `{max_neighs}` neighbors is not yet implemented.")
+    """Run diffusion for each gene column, parallelised across threads."""
 
-    score = []
-    for i in ixs:
-        if isinstance(vals, spmatrix):
-            conc = vals[:, i].toarray().flatten()
+    sparse = issparse(vals)
+
+    def _process_gene(i: int) -> float:
+        if sparse:
+            conc = np.ascontiguousarray(vals[:, i].toarray().ravel(), dtype=np.float64)
         else:
-            conc = vals[:, i].copy()
-        time_iter = _diffusion(conc, fun, n_iter, sat, sat_idx, unsat, unsat_idx, dt=dt, thresh=thresh)
-        score.append(dt * time_iter)
+            conc = np.ascontiguousarray(vals[:, i], dtype=np.float64)
+        time_iter = _diffusion(
+            conc,
+            use_hex,
+            n_iter,
+            sat,
+            sat_idx,
+            unsat,
+            unsat_idx,
+            dt,
+            thresh,
+        )
+        return dt * time_iter
 
-        if queue is not None:
-            queue.put(Signal.UPDATE)
+    scores = thread_map(
+        _process_gene,
+        range(vals.shape[1]),
+        n_jobs=n_jobs,
+        show_progress_bar=show_progress_bar,
+        unit="gene",
+    )
+    return np.array(scores)
 
-    if queue is not None:
-        queue.put(Signal.FINISH)
 
-    return np.array(score)
-
-
-@njit(fastmath=True)
+@njit(fastmath=True, nogil=True)
 def _diffusion(
     conc: NDArrayA,
-    laplacian: Callable[[NDArrayA, NDArrayA, NDArrayA], float],
+    use_hex: bool,
     n_iter: int,
     sat: NDArrayA,
     sat_idx: NDArrayA,
     unsat: NDArrayA,
     unsat_idx: NDArrayA,
-    dt: float = 0.001,
-    D: float = 1.0,
-    thresh: float = 1e-8,
+    dt: float,
+    thresh: float,
 ) -> float:
     """Simulate diffusion process on a regular graph."""
-    sat_shape, conc_shape = sat.shape[0], conc.shape[0]
+    sat_shape = sat.shape[0]
+    n_cells = conc.shape[0]
     entropy_arr = np.zeros(n_iter)
-    prev_ent = 1.0
     nhood = np.zeros(sat_shape)
-    weights = np.ones(sat_shape)
+    dcdt = np.zeros(n_cells)
+    prev_ent = 1.0
 
     for i in range(n_iter):
         for j in range(sat_shape):
             nhood[j] = np.sum(conc[sat_idx[j]])
-        d2 = laplacian(conc[sat], nhood, weights)
+        if use_hex:
+            d2 = _laplacian_hex(conc[sat], nhood)
+        else:
+            d2 = _laplacian_rect(conc[sat], nhood)
 
-        dcdt = np.zeros(conc_shape)
-        dcdt[sat] = D * d2
+        dcdt[:] = 0.0
+        dcdt[sat] = d2
         conc[sat] += dcdt[sat] * dt
         conc[unsat] += dcdt[unsat_idx] * dt
         # set values below zero to 0
@@ -245,7 +256,6 @@ def _diffusion(
 def _laplacian_rect(
     centers: NDArrayA,
     nbrs: NDArrayA,
-    h: float,
 ) -> NDArrayA:
     """
     Five point stencil approximation on rectilinear grid.
@@ -253,8 +263,6 @@ def _laplacian_rect(
     See `Wikipedia <https://en.wikipedia.org/wiki/Five-point_stencil>`_ for more information.
     """
     d2f: NDArrayA = nbrs - 4 * centers
-    d2f = d2f / h**2
-
     return d2f
 
 
@@ -263,7 +271,6 @@ def _laplacian_rect(
 def _laplacian_hex(
     centers: NDArrayA,
     nbrs: NDArrayA,
-    h: float,
 ) -> NDArrayA:
     """
     Seven point stencil approximation on hexagonal grid.
@@ -274,10 +281,7 @@ def _laplacian_hex(
     Curtis D. Benster, L.V. Kantorovich, V.I. Krylov,
     ISBN-13: 978-0486821603.
     """
-    d2f: NDArrayA = nbrs - 6 * centers
-    d2f = d2f / h**2
-    d2f = (d2f * 2) / 3
-
+    d2f: NDArrayA = (2.0 * nbrs - 12.0 * centers) / 3.0
     return d2f
 
 
@@ -286,11 +290,18 @@ def _laplacian_hex(
 def _entropy(
     xx: NDArrayA,
 ) -> float:
-    """Get entropy of an array."""
+    """Compute Shannon entropy of an array of probability values (in nats)."""
     xnz = xx[xx > 0]
     xs: np.float64 = np.sum(xnz)
+    eps = np.finfo(np.float64).eps  # ~2.22e-16
+    if xs < eps:
+        # 0 because
+        # xn represents probabilities
+        # and p(x)=0 is taken as 0 entropy
+        # see https://stats.stackexchange.com/a/433096
+        return 0.0
     xn = xnz / xs
-    xl = np.log(xn)
+    xl = np.log(np.maximum(xn, eps))
     return float((-xl * xn).sum())
 
 

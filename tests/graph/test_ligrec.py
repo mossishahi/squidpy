@@ -3,7 +3,6 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping, Sequence
 from itertools import product
-from time import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,7 +12,7 @@ import scanpy as sc
 from anndata import AnnData
 from pandas.testing import assert_frame_equal
 from scanpy import settings as s
-from scanpy.datasets import blobs
+from scipy.sparse import csc_matrix
 
 from squidpy._constants._pkg_constants import Key
 from squidpy.gr import ligrec
@@ -33,13 +32,6 @@ class TestInvalidBehavior:
         del adata.raw
         with pytest.raises(AttributeError, match=r"No `.raw` attribute"):
             ligrec(adata, _CK, use_raw=True)
-
-    def test_raw_has_different_n_obs(self, adata: AnnData):
-        adata.raw = blobs(n_observations=adata.n_obs + 1)
-        # raise below happend with anndata < 0.9
-        # with pytest.raises(ValueError, match=rf"Expected `{adata.n_obs}` cells in `.raw`"):
-        with pytest.raises(ValueError, match=rf"Index length mismatch: {adata.n_obs} vs. {adata.n_obs + 1}"):
-            ligrec(adata, _CK)
 
     def test_invalid_cluster_key(self, adata: AnnData, interactions: Interactions_t):
         with pytest.raises(KeyError, match=r"Cluster key `foobar` not found"):
@@ -165,7 +157,7 @@ class TestValidBehavior:
             interactions=interactions,
             n_perms=5,
             corr_axis="clusters",
-            seed=42,
+            rng=np.random.default_rng(42),
             n_jobs=1,
             show_progress_bar=False,
             copy=True,
@@ -178,7 +170,7 @@ class TestValidBehavior:
             corr_axis="interactions",
             n_jobs=1,
             show_progress_bar=False,
-            seed=42,
+            rng=np.random.default_rng(42),
             copy=True,
         )
 
@@ -260,7 +252,15 @@ class TestValidBehavior:
         if TYPE_CHECKING:
             assert isinstance(interactions, pd.DataFrame)
         interactions["metadata"] = "foo"
-        r = ligrec(adata, _CK, interactions=interactions, n_perms=5, seed=2, copy=True, show_progress_bar=False)
+        r = ligrec(
+            adata,
+            _CK,
+            interactions=interactions,
+            n_perms=5,
+            rng=np.random.default_rng(2),
+            copy=True,
+            show_progress_bar=False,
+        )
 
         assert r["means"].sparse.density <= 0.15
         assert r["pvalues"].sparse.density <= 0.95
@@ -280,7 +280,7 @@ class TestValidBehavior:
             n_perms=25,
             copy=True,
             show_progress_bar=False,
-            seed=42,
+            rng=np.random.default_rng(42),
             n_jobs=n_jobs,
         )
         r2 = ligrec(
@@ -290,7 +290,7 @@ class TestValidBehavior:
             n_perms=25,
             copy=True,
             show_progress_bar=False,
-            seed=42,
+            rng=np.random.default_rng(42),
             n_jobs=n_jobs,
         )
         r3 = ligrec(
@@ -300,7 +300,7 @@ class TestValidBehavior:
             n_perms=25,
             copy=True,
             show_progress_bar=False,
-            seed=43,
+            rng=np.random.default_rng(43),
             n_jobs=n_jobs,
         )
 
@@ -312,38 +312,26 @@ class TestValidBehavior:
         assert not np.allclose(r3["pvalues"], r1["pvalues"])
         assert not np.allclose(r3["pvalues"], r2["pvalues"])
 
-    def test_reproducibility_numba_parallel_off(self, adata: AnnData, interactions: Interactions_t):
-        t1 = time()
-        r1 = ligrec(
-            adata,
-            _CK,
-            interactions=interactions,
-            n_perms=25,
-            copy=True,
-            show_progress_bar=False,
-            seed=42,
-            numba_parallel=False,
-        )
-        t1 = time() - t1
+    def test_n_jobs_invariance(self, adata: AnnData, interactions: Interactions_t):
+        """The number of threads must not change the result (each permutation is seeded independently)."""
+        kw = {"interactions": interactions, "n_perms": 25, "copy": True, "show_progress_bar": False, "rng": 42}
+        res_serial = ligrec(adata, _CK, n_jobs=1, **kw)
+        res_parallel = ligrec(adata, _CK, n_jobs=2, **kw)
 
-        t2 = time()
-        r2 = ligrec(
-            adata,
-            _CK,
-            interactions=interactions,
-            n_perms=25,
-            copy=True,
-            show_progress_bar=False,
-            seed=42,
-            numba_parallel=True,
-        )
-        t2 = time() - t2
+        np.testing.assert_allclose(res_serial["means"], res_parallel["means"])
+        np.testing.assert_allclose(res_serial["pvalues"], res_parallel["pvalues"])
 
-        assert r1 is not r2
-        # for such a small data, overhead from parallelization is too high
-        assert t1 <= t2, (t1, t2)
-        np.testing.assert_allclose(r1["means"], r2["means"])
-        np.testing.assert_allclose(r1["pvalues"], r2["pvalues"])
+    @pytest.mark.parametrize("param", ["numba_parallel", "backend"])
+    def test_deprecated_parallelization_params(self, adata: AnnData, interactions: Interactions_t, param: str):
+        """The removed parallelization arguments warn instead of raising, on both entry points."""
+        kw = {"n_perms": 5, "copy": True, "show_progress_bar": False, "rng": 42}
+
+        with pytest.warns(FutureWarning, match=rf"Parameter `{param}` of `ligrec\(\)` is deprecated"):
+            ligrec(adata, _CK, interactions=interactions, **{param: True}, **kw)
+
+        pt = PermutationTest(adata).prepare(interactions=interactions)
+        with pytest.warns(FutureWarning, match=rf"Parameter `{param}` of `test\(\)` is deprecated"):
+            pt.test(_CK, **{param: True}, **kw)
 
     def test_paul15_correct_means(self, paul15: AnnData, paul15_means: pd.DataFrame):
         res = ligrec(
@@ -354,7 +342,7 @@ class TestValidBehavior:
             copy=True,
             show_progress_bar=False,
             threshold=0.01,
-            seed=0,
+            rng=np.random.default_rng(0),
             n_perms=1,
             n_jobs=1,
         )
@@ -363,20 +351,29 @@ class TestValidBehavior:
         np.testing.assert_array_equal(res["means"].columns, paul15_means.columns)
         np.testing.assert_allclose(res["means"].values, paul15_means.values)
 
-    def test_reproducibility_numba_off(
-        self, adata: AnnData, interactions: Interactions_t, ligrec_no_numba: Mapping[str, pd.DataFrame]
+    def test_pvalues_reference(
+        self, adata: AnnData, interactions: Interactions_t, ligrec_pvalues_reference: Mapping[str, pd.DataFrame]
     ):
         r = ligrec(
-            adata, _CK, interactions=interactions, n_perms=5, copy=True, show_progress_bar=False, seed=42, n_jobs=1
+            adata,
+            _CK,
+            interactions=interactions,
+            n_perms=25,
+            copy=True,
+            show_progress_bar=False,
+            rng=np.random.default_rng(42),
+            n_jobs=1,
         )
-        np.testing.assert_array_equal(r["means"].index, ligrec_no_numba["means"].index)
-        np.testing.assert_array_equal(r["means"].columns, ligrec_no_numba["means"].columns)
-        np.testing.assert_array_equal(r["pvalues"].index, ligrec_no_numba["pvalues"].index)
-        np.testing.assert_array_equal(r["pvalues"].columns, ligrec_no_numba["pvalues"].columns)
+        np.testing.assert_array_equal(r["means"].index, ligrec_pvalues_reference["means"].index)
+        np.testing.assert_array_equal(r["means"].columns, ligrec_pvalues_reference["means"].columns)
+        np.testing.assert_array_equal(r["pvalues"].index, ligrec_pvalues_reference["pvalues"].index)
+        np.testing.assert_array_equal(r["pvalues"].columns, ligrec_pvalues_reference["pvalues"].columns)
 
-        np.testing.assert_allclose(r["means"], ligrec_no_numba["means"])
-        np.testing.assert_allclose(r["pvalues"], ligrec_no_numba["pvalues"])
-        np.testing.assert_array_equal(np.where(np.isnan(r["pvalues"])), np.where(np.isnan(ligrec_no_numba["pvalues"])))
+        np.testing.assert_allclose(r["means"], ligrec_pvalues_reference["means"])
+        np.testing.assert_allclose(r["pvalues"], ligrec_pvalues_reference["pvalues"])
+        np.testing.assert_array_equal(
+            np.where(np.isnan(r["pvalues"])), np.where(np.isnan(ligrec_pvalues_reference["pvalues"]))
+        )
 
     def test_logging(self, adata: AnnData, interactions: Interactions_t, capsys):
         s.logfile = sys.stderr
@@ -401,7 +398,7 @@ class TestValidBehavior:
         assert "DEBUG: Creating all gene combinations within complexes" in err
         assert "DEBUG: Removing interactions with no genes in the data" in err
         assert "DEBUG: Removing genes not in any interaction" in err
-        assert "Running `5` permutations on `25` interactions and `25` cluster combinations using `2` core(s)" in err
+        assert "Running `5` permutations on `25` interactions and `25` cluster combinations using `2` thread(s)" in err
         assert "Adding `adata.uns['ligrec_test']`" in err
 
     def test_non_uniqueness(self, adata: AnnData, interactions: Interactions_t):
@@ -418,8 +415,7 @@ class TestValidBehavior:
             n_perms=1,
             copy=True,
             show_progress_bar=False,
-            seed=42,
-            numba_parallel=False,
+            rng=np.random.default_rng(42),
         )
 
         assert len(res["pvalues"]) == len(expected)
@@ -461,3 +457,104 @@ class TestValidBehavior:
         )
         assert isinstance(pt.interactions, pd.DataFrame)
         assert len(pt.interactions) == 1
+
+    def test_ligrec_nan_counts(self):
+        """
+        For the test case with 2 clusters (A, B) and 3 gene pairs (Gene1→Gene2, Gene2→Gene3, Gene3→Gene1):
+
+        The mask is computed for each gene in each cluster as:
+        mask[gene, cluster] = (number of cells with value > 0) / (total cells in cluster) >= threshold
+
+        Number of cells with value > 0 in each cluster:
+        Cluster A: [1, 3, 0]
+        Cluster B: [1, 0, 3]
+
+        Number of cells with value > 0 in each cluster divided by total number of cells in the cluster:
+        Cluster A: [1/3, 3/3, 0/3] = [0.33, 1.0, 0.0]
+        Cluster B: [1/3, 0/3, 3/3] = [0.33, 0.0, 1.0]
+
+        Using threshold=0.8 on this data, the mask is:
+        Cluster A: [False, True, False]
+        Cluster B: [False, False, True]
+
+        A value in the result becomes NaN if either:
+        - The ligand's mask is False in the source cluster, OR
+        - The receptor's mask is False in the target cluster
+
+        Only in one combination, the mask is both True in the source and target cluster.
+        This is the case for Gene2→Gene3 in A→B.
+
+        This means from all the possible cluster pairs (A→A, A→B, B→A, B→B) and gene pairs (Gene1→Gene2, Gene2→Gene3, Gene3→Gene1),
+        (4 cluster pairs * 3 gene pairs = 12 combinations) only one combination is non-NaN.
+
+        Therefore, the total number of NaNs is 11.
+
+        The expected p-values are:
+        cluster_1        A         B
+        cluster_2        A    B    A    B
+        source target
+        GENE1  GENE2   NaN  NaN  NaN  NaN
+        GENE2  GENE3   NaN  0.0  NaN  NaN
+        GENE3  GENE1   NaN  NaN  NaN  NaN
+
+        """
+        # only Gene2→Gene3 is non-NaN
+        #
+
+        expected_pvalues = np.array(
+            [
+                [
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                ],
+                [
+                    np.nan,
+                    0.0,
+                    np.nan,
+                    np.nan,
+                ],
+                [
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                ],
+            ]
+        )
+
+        expected_nans = 11
+        # Setup test data
+        threshold = 0.8
+        interactions = pd.DataFrame({"source": ["Gene1", "Gene2", "Gene3"], "target": ["Gene2", "Gene3", "Gene1"]})
+
+        # Create sparse matrix with test data
+        X = csc_matrix(
+            [
+                [1.0, 0.1, 0.0],  # A1
+                [0.0, 1.0, 0.0],  # A2
+                [0.0, 1.0, 0.0],  # A3
+                [0.1, 0.0, 1.0],  # B1
+                [0.0, 0.0, 1.0],  # B2
+                [0.0, 0.0, 1.0],  # B3
+            ]
+        )
+
+        # Create AnnData object
+        adata = AnnData(
+            X=X,
+            obs=pd.DataFrame({"cluster": ["A"] * 3 + ["B"] * 3}, index=[f"cell{i}" for i in range(1, 7)]),
+            var=pd.DataFrame(index=["Gene1", "Gene2", "Gene3"]),
+        )
+        adata.obs["cluster"] = adata.obs["cluster"].astype("category")
+
+        # Run ligrec and compare NaN counts
+        res = ligrec(
+            adata, cluster_key="cluster", interactions=interactions, threshold=threshold, use_raw=False, copy=True
+        )
+
+        actual_nans = np.sum(np.isnan(res["pvalues"].values))
+
+        assert actual_nans == expected_nans, f"NaN count mismatch: expected {expected_nans}, got {actual_nans}"
+        np.testing.assert_array_equal(res["pvalues"].values, expected_pvalues)

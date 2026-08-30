@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from itertools import chain
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import Sequence
+from typing import Any, Literal
 
 import numba.types as nt
 import numpy as np
 import pandas as pd
 from anndata import AnnData
-from numba import njit
-from numpy.random import default_rng
+from numba import njit, prange
 from scanpy import logging as logg
-from scanpy.get import _get_obs_rep
-from scanpy.metrics._gearys_c import _gearys_c
-from scanpy.metrics._morans_i import _morans_i
+from scanpy.metrics import gearys_c, morans_i
 from scipy import stats
 from scipy.sparse import spmatrix
 from sklearn.metrics import pairwise_distances
@@ -26,14 +22,24 @@ from statsmodels.stats.multitest import multipletests
 from squidpy._constants._constants import SpatialAutocorr
 from squidpy._constants._pkg_constants import Key
 from squidpy._docs import d, inject_docs
-from squidpy._utils import NDArrayA, Signal, SigQueue, _get_n_cores, parallelize
+from squidpy._utils import (
+    NDArrayA,
+    RNGLike,
+    SeedLike,
+    Signal,
+    SigQueue,
+    deprecated_params,
+    deprecated_randomness_param,
+    get_n_processes,
+    parallelize,
+)
+from squidpy._validators import assert_key_in_adata, assert_positive
 from squidpy.gr._utils import (
     _assert_categorical_obs,
     _assert_connectivity_key,
-    _assert_non_empty_sequence,
-    _assert_positive,
     _assert_spatial_basis,
     _save_data,
+    extract_adata_if_sdata,
 )
 
 __all__ = ["spatial_autocorr", "co_occurrence"]
@@ -49,32 +55,47 @@ bl = nt.boolean
 
 @d.dedent
 @inject_docs(key=Key.obsp.spatial_conn(), sp=SpatialAutocorr)
+@deprecated_randomness_param
 def spatial_autocorr(
     adata: AnnData | SpatialData,
     connectivity_key: str = Key.obsp.spatial_conn(),
     genes: str | int | Sequence[str] | Sequence[int] | None = None,
-    mode: Literal["moran", "geary"] = SpatialAutocorr.MORAN.s,  # type: ignore[assignment]
+    mode: SpatialAutocorr | Literal["moran", "geary"] = "moran",
     transformation: bool = True,
     n_perms: int | None = None,
     two_tailed: bool = False,
     corr_method: str | None = "fdr_bh",
     attr: Literal["obs", "X", "obsm"] = "X",
     layer: str | None = None,
-    seed: int | None = None,
+    rng: SeedLike | RNGLike | None = None,
     use_raw: bool = False,
     copy: bool = False,
     n_jobs: int | None = None,
     backend: str = "loky",
     show_progress_bar: bool = True,
+    *,
+    table_key: str | None = None,
 ) -> pd.DataFrame | None:
     """
     Calculate Global Autocorrelation Statistic (Moran’s I  or Geary's C).
 
     See :cite:`pysal` for reference.
 
+    .. versionchanged:: 1.8.2
+        The analytic (normality-assumption) variance for Geary's C was corrected; previously the
+        Moran's I variance was reused for ``mode = 'geary'``. As a result, ``'var_norm'`` and
+        ``'pval_norm'`` for Geary's C differ from earlier versions. Permutation-based p-values
+        (``'pval_sim'``, ``'pval_z_sim'``) are unaffected.
+        See `#1183 <https://github.com/scverse/squidpy/issues/1183>`_.
+
+    %(seed_versionchanged)s
+
+    %(rng_versionchanged)s
+
     Parameters
     ----------
     %(adata)s
+    %(table_key)s
     %(conn_key)s
     genes
         Depending on the ``attr``:
@@ -108,7 +129,7 @@ def spatial_autocorr(
         Layer in :attr:`anndata.AnnData.layers` to use. If `None`, use :attr:`anndata.AnnData.X`.
     attr
         Which attribute of :class:`~anndata.AnnData` to access. See ``genes`` parameter for more information.
-    %(seed)s
+    %(rng)s
     %(copy)s
     %(parallelize)s
 
@@ -132,8 +153,7 @@ def spatial_autocorr(
         - :attr:`anndata.AnnData.uns` ``['moranI']`` - the above mentioned dataframe, if ``mode = {sp.MORAN.s!r}``.
         - :attr:`anndata.AnnData.uns` ``['gearyC']`` - the above mentioned dataframe, if ``mode = {sp.GEARY.s!r}``.
     """
-    if isinstance(adata, SpatialData):
-        adata = adata.table
+    adata = extract_adata_if_sdata(adata, table_key=table_key)
     _assert_connectivity_key(adata, connectivity_key)
 
     def extract_X(adata: AnnData, genes: str | Sequence[str] | None) -> tuple[NDArrayA | spmatrix, Sequence[Any]]:
@@ -146,7 +166,8 @@ def spatial_autocorr(
             genes = [genes]
 
         if not use_raw:
-            return _get_obs_rep(adata[:, genes], use_raw=False, layer=layer).T, genes
+            subset = adata[:, genes]
+            return (subset.X if layer is None else subset.layers[layer]).T, genes
         if adata.raw is None:
             raise AttributeError("No `.raw` attribute found. Try specifying `use_raw=False`.")
         genes = list(set(genes) & set(adata.raw.var_names))
@@ -161,42 +182,32 @@ def spatial_autocorr(
         return adata.obs[cols].T.to_numpy(), cols
 
     def extract_obsm(adata: AnnData, ixs: int | Sequence[int] | None) -> tuple[NDArrayA | spmatrix, Sequence[Any]]:
-        if layer not in adata.obsm:
-            raise KeyError(f"Key `{layer!r}` not found in `adata.obsm`.")
+        assert_key_in_adata(adata, layer, attr="obsm")
         if ixs is None:
-            ixs = list(range(adata.obsm[layer].shape[1]))
-        elif isinstance(ixs, int):
-            ixs = [ixs]
-        else:
-            ixs = list(ixs)
+            ixs = list(np.arange(adata.obsm[layer].shape[1]))
+        ixs = list(np.ravel([ixs]))
 
         return adata.obsm[layer][:, ixs].T, ixs
 
     if attr == "X":
-        vals, index = extract_X(adata, genes)  # type: ignore[arg-type]
+        vals, index = extract_X(adata, genes)  # type: ignore
     elif attr == "obs":
-        vals, index = extract_obs(adata, genes)  # type: ignore[arg-type]
+        vals, index = extract_obs(adata, genes)  # type: ignore
     elif attr == "obsm":
-        vals, index = extract_obsm(adata, genes)  # type: ignore[arg-type]
+        vals, index = extract_obsm(adata, genes)  # type: ignore
     else:
         raise NotImplementedError(f"Extracting from `adata.{attr}` is not yet implemented.")
 
-    mode = SpatialAutocorr(mode)  # type: ignore[assignment]
-    if TYPE_CHECKING:
-        assert isinstance(mode, SpatialAutocorr)
-    params = {
-        "mode": mode.s,
-        "transformation": transformation,
-        "two_tailed": two_tailed,
-    }
+    mode = SpatialAutocorr(mode)
+    params = {"mode": mode.s, "transformation": transformation, "two_tailed": two_tailed}
 
     if mode == SpatialAutocorr.MORAN:
-        params["func"] = _morans_i
+        params["func"] = morans_i
         params["stat"] = "I"
         params["expected"] = -1.0 / (adata.shape[0] - 1)  # expected score
         params["ascending"] = False
     elif mode == SpatialAutocorr.GEARY:
-        params["func"] = _gearys_c
+        params["func"] = gearys_c
         params["stat"] = "C"
         params["expected"] = 1.0
         params["ascending"] = True
@@ -207,30 +218,31 @@ def spatial_autocorr(
     if transformation:  # row-normalize
         normalize(g, norm="l1", axis=1, copy=False)
 
-    score = params["func"](g, vals)
+    score = params["func"](g, vals)  # type: ignore
 
-    n_jobs = _get_n_cores(n_jobs)
+    n_jobs = get_n_processes(n_jobs)
     start = logg.info(f"Calculating {mode}'s statistic for `{n_perms}` permutations using `{n_jobs}` core(s)")
     if n_perms is not None:
-        _assert_positive(n_perms, name="n_perms")
-        perms = np.arange(n_perms)
+        assert_positive(n_perms, name="n_perms")
+        perms = list(np.arange(n_perms))
+        generators = np.random.default_rng(rng).spawn(n_perms)
 
         score_perms = parallelize(
             _score_helper,
             collection=perms,
             extractor=np.concatenate,
-            use_ixs=True,
             n_jobs=n_jobs,
             backend=backend,
             show_progress_bar=show_progress_bar,
-        )(mode=mode, g=g, vals=vals, seed=seed)
+        )(mode=mode, g=g, vals=vals, generators=generators)
     else:
         score_perms = None
 
     with np.errstate(divide="ignore"):
         pval_results = _p_value_calc(score, score_perms, g, params)
 
-    df = pd.DataFrame({params["stat"]: score, **pval_results}, index=index)
+    data_dict: dict[str, Any] = {str(params["stat"]): score, **pval_results}
+    df = pd.DataFrame(data_dict, index=index)
 
     if corr_method is not None:
         for pv in filter(lambda x: "pval" in x, df.columns):
@@ -243,23 +255,24 @@ def spatial_autocorr(
         logg.info("Finish", time=start)
         return df
 
-    _save_data(adata, attr="uns", key=params["mode"] + params["stat"], data=df, time=start)
+    mode_str = str(params["mode"])
+    stat_str = str(params["stat"])
+    _save_data(adata, attr="uns", key=mode_str + stat_str, data=df, time=start)
 
 
 def _score_helper(
-    ix: int,
     perms: Sequence[int],
     mode: SpatialAutocorr,
     g: spmatrix,
     vals: NDArrayA,
-    seed: int | None = None,
+    generators: Sequence[np.random.Generator],
     queue: SigQueue | None = None,
 ) -> pd.DataFrame:
     score_perms = np.empty((len(perms), vals.shape[0]))
-    rng = default_rng(None if seed is None else ix + seed)
-    func = _morans_i if mode == SpatialAutocorr.MORAN else _gearys_c
+    func = morans_i if mode == SpatialAutocorr.MORAN else gearys_c
 
-    for i in range(len(perms)):
+    for i, p in enumerate(perms):
+        rng = generators[p]
         idx_shuffle = rng.permutation(g.shape[0])
         score_perms[i, :] = func(g[idx_shuffle, :], vals)
 
@@ -272,98 +285,94 @@ def _score_helper(
     return score_perms
 
 
-@njit(
-    ft[:, :, :](tt(it[:], 2), ft[:, :], it[:], ft[:], bl),
-    parallel=False,
-    fastmath=True,
-)
+@njit(parallel=True, fastmath=True, cache=True)
 def _occur_count(
-    clust: tuple[NDArrayA, NDArrayA],
-    pw_dist: NDArrayA,
-    labs_unique: NDArrayA,
-    interval: NDArrayA,
-    same_split: bool,
+    spatial_x: NDArrayA, spatial_y: NDArrayA, thresholds: NDArrayA, label_idx: NDArrayA, n: int, k: int, l_val: int
 ) -> NDArrayA:
-    num = labs_unique.shape[0]
-    out = np.zeros((num, num, interval.shape[0] - 1), dtype=ft)
+    # Allocate a 2D array to store a flat local result per point.
+    k2 = k * k
+    local_results = np.zeros((n, l_val * k2), dtype=np.int32)
 
-    for idx in range(interval.shape[0] - 1):
-        co_occur = np.zeros((num, num), dtype=ft)
-        probs_con = np.zeros((num, num), dtype=ft)
+    for i in prange(n):
+        for j in range(n):
+            if i == j:
+                continue
+            dx = spatial_x[i] - spatial_x[j]
+            dy = spatial_y[i] - spatial_y[j]
+            d2 = dx * dx + dy * dy
 
-        thres_max = interval[idx + 1]
-        clust_x, clust_y = clust
+            pair = label_idx[i] * k + label_idx[j]  # fixed in r-loop
+            base = pair * l_val  # first cell for that pair
 
-        # Modified to compute co-occurrence probability ratio over increasing radii sizes as opposed to discrete interval bins
-        # Need pw_dist > 0 to avoid counting a cell with itself as co-occurrence
-        idx_x, idx_y = np.nonzero((pw_dist <= thres_max) & (pw_dist > 0))
-        x = clust_x[idx_x]
-        y = clust_y[idx_y]
-        # Treat computing co-occurrence using the same split and different splits differently
-        # Pairwise distance matrix for between the same split is symmetric and therefore only needs to be counted once
-        for i, j in zip(x, y):  # noqa: B905 # cannot use strict=False because of numba
-            co_occur[i, j] += 1
-            if not same_split:
-                co_occur[j, i] += 1
+            for r in range(l_val):
+                if d2 <= thresholds[r]:
+                    local_results[i][base + r] += 1
 
-        # Prevent divison by zero errors when we have low cell counts/small intervals
-        probs_matrix = co_occur / np.sum(co_occur) if np.sum(co_occur) != 0 else np.zeros((num, num), dtype=ft)
-        probs = np.sum(probs_matrix, axis=0)
+    # reduction and reshape stay the same
+    result_flat = local_results.sum(axis=0)
+    result: NDArrayA = result_flat.reshape(k, k, l_val)
 
-        for c in labs_unique:
-            probs_conditional = (
-                co_occur[c] / np.sum(co_occur[c]) if np.sum(co_occur[c]) != 0 else np.zeros(num, dtype=ft)
-            )
-            probs_con[c, :] = np.zeros(num, dtype=ft)
-            for i in range(num):
-                if probs[i] == 0:
-                    probs_con[c, i] = 0
-                else:
-                    probs_con[c, i] = probs_conditional[i] / probs[i]
-
-        out[:, :, idx] = probs_con
-
-    return out
+    return result
 
 
-def _co_occurrence_helper(
-    idx_splits: Iterable[tuple[int, int]],
-    spatial_splits: Sequence[NDArrayA],
-    labs_splits: Sequence[NDArrayA],
-    labs_unique: NDArrayA,
-    interval: NDArrayA,
-    queue: SigQueue | None = None,
-) -> pd.DataFrame:
-    out_lst = []
-    for t in idx_splits:
-        idx_x, idx_y = t
-        labs_x = labs_splits[idx_x]
-        labs_y = labs_splits[idx_y]
-        dist = pairwise_distances(spatial_splits[idx_x], spatial_splits[idx_y])
+@njit(parallel=True, fastmath=True, cache=True)
+def _co_occurrence_helper(v_x: NDArrayA, v_y: NDArrayA, v_radium: NDArrayA, labs: NDArrayA) -> NDArrayA:
+    """
+    Fast co-occurrence probability computation using the new numba-accelerated counting.
 
-        out = _occur_count((labs_x, labs_y), dist, labs_unique, interval, idx_x == idx_y)
-        out_lst.append(out)
+    Parameters
+    ----------
+    v_x : np.ndarray, float64
+         x-coordinates.
+    v_y : np.ndarray, float64
+         y-coordinates.
+    v_radium : np.ndarray, float64
+         Distance thresholds (in ascending order).
+    labs : np.ndarray
+         Cluster labels (as integers).
 
-        if queue is not None:
-            queue.put(Signal.UPDATE)
+    Returns
+    -------
+    occ_prob : np.ndarray
+         A 3D array of shape (k, k, len(v_radium)-1) containing the co-occurrence probabilities.
+    labs_unique : np.ndarray
+         Array of unique labels.
+    """
+    n = len(v_x)
+    labs_unique = np.unique(labs)
+    k = len(labs_unique)
+    # l_val is the number of bins; here we assume the thresholds come from v_radium[1:].
+    l_val = len(v_radium) - 1
+    # Compute squared thresholds from the interval (skip the first value)
+    thresholds = (v_radium[1:]) ** 2
 
-    if queue is not None:
-        queue.put(Signal.FINISH)
+    # Compute co-occurence counts.
+    counts = _occur_count(v_x, v_y, thresholds, labs, n, k, l_val)
 
-    return out_lst
+    occ_prob = np.zeros((k, k, l_val), dtype=np.float64)
+    row_sums = counts.sum(axis=0)
+    totals = row_sums.sum(axis=0)
+
+    for r in prange(l_val):
+        probs = row_sums[:, r] / totals[r]
+        for c in range(k):
+            for i in range(k):
+                if probs[i] != 0.0 and row_sums[c, r] != 0.0:
+                    occ_prob[i, c, r] = (counts[c, i, r] / row_sums[c, r]) / probs[i]
+
+    return occ_prob
 
 
 @d.dedent
+@deprecated_params({"n_splits": "1.10.0", "n_jobs": "1.10.0", "backend": "1.10.0", "show_progress_bar": "1.10.0"})
 def co_occurrence(
     adata: AnnData | SpatialData,
     cluster_key: str,
     spatial_key: str = Key.obsm.spatial,
     interval: int | NDArrayA = 50,
     copy: bool = False,
-    n_splits: int | None = None,
-    n_jobs: int | None = None,
-    backend: str = "loky",
-    show_progress_bar: bool = True,
+    *,
+    table_key: str | None = None,
 ) -> tuple[NDArrayA, NDArrayA] | None:
     """
     Compute co-occurrence probability of clusters.
@@ -371,16 +380,13 @@ def co_occurrence(
     Parameters
     ----------
     %(adata)s
+    %(table_key)s
     %(cluster_key)s
     %(spatial_key)s
     interval
         Distances interval at which co-occurrence is computed. If :class:`int`, uniformly spaced interval
         of the given size will be used.
     %(copy)s
-    n_splits
-        Number of splits in which to divide the spatial coordinates in
-        :attr:`anndata.AnnData.obsm` ``['{spatial_key}']``.
-    %(parallelize)s
 
     Returns
     -------
@@ -393,18 +399,14 @@ def co_occurrence(
         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_co_occurrence']['interval']`` - the distance thresholds
           computed at ``interval``.
     """
-    if isinstance(adata, SpatialData):
-        adata = adata.table
+    adata = extract_adata_if_sdata(adata, table_key=table_key)
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
 
     spatial = adata.obsm[spatial_key].astype(fp)
     original_clust = adata.obs[cluster_key]
-
-    # annotate cluster idx
     clust_map = {v: i for i, v in enumerate(original_clust.cat.categories.values)}
     labs = np.array([clust_map[c] for c in original_clust], dtype=ip)
-    labs_unique = np.array(list(clust_map.values()), dtype=ip)
 
     # create intervals thresholds
     if isinstance(interval, int):
@@ -415,57 +417,19 @@ def co_occurrence(
     if len(interval) <= 1:
         raise ValueError(f"Expected interval to be of length `>= 2`, found `{len(interval)}`.")
 
-    n_obs = spatial.shape[0]
-    if n_splits is None:
-        size_arr = (n_obs**2 * spatial.itemsize) / 1024 / 1024  # calc expected mem usage
-        n_splits = 1
-        if size_arr > 2000:
-            while (n_obs / n_splits) > 2048:
-                n_splits += 1
-            logg.warning(
-                f"`n_splits` was automatically set to `{n_splits}` to "
-                f"prevent `{n_obs}x{n_obs}` distance matrix from being created"
-            )
-    n_splits = int(max(min(n_splits, n_obs), 1))
+    spatial_x = spatial[:, 0]
+    spatial_y = spatial[:, 1]
 
-    # split array and labels
-    spatial_splits = tuple(s for s in np.array_split(spatial, n_splits, axis=0) if len(s))
-    labs_splits = tuple(s for s in np.array_split(labs, n_splits, axis=0) if len(s))
-    # create idx array including unique combinations and self-comparison
-    x, y = np.triu_indices_from(np.empty((n_splits, n_splits)))
-    idx_splits = list(zip(x, y, strict=False))
-
-    n_jobs = _get_n_cores(n_jobs)
-    start = logg.info(
-        f"Calculating co-occurrence probabilities for `{len(interval)}` intervals "
-        f"`{len(idx_splits)}` split combinations using `{n_jobs}` core(s)"
-    )
-
-    out_lst = parallelize(
-        _co_occurrence_helper,
-        collection=idx_splits,
-        extractor=chain.from_iterable,
-        n_jobs=n_jobs,
-        backend=backend,
-        show_progress_bar=show_progress_bar,
-    )(
-        spatial_splits=spatial_splits,
-        labs_splits=labs_splits,
-        labs_unique=labs_unique,
-        interval=interval,
-    )
-    out = list(out_lst)[0] if len(idx_splits) == 1 else sum(list(out_lst)) / len(idx_splits)
+    # Compute co-occurrence probabilities using the fast numba routine.
+    out = _co_occurrence_helper(spatial_x, spatial_y, interval, labs)
+    start = logg.info(f"Calculating co-occurrence probabilities for `{len(interval)}` intervals")
 
     if copy:
         logg.info("Finish", time=start)
         return out, interval
 
     _save_data(
-        adata,
-        attr="uns",
-        key=Key.uns.co_occurrence(cluster_key),
-        data={"occ": out, "interval": interval},
-        time=start,
+        adata, attr="uns", key=Key.uns.co_occurrence(cluster_key), data={"occ": out, "interval": interval}, time=start
     )
 
 
@@ -549,11 +513,23 @@ def _analytic_pval(score: NDArrayA, g: spmatrix | NDArrayA, params: dict[str, An
     s0, s1, s2 = _g_moments(g)
     n = g.shape[0]
     s02 = s0 * s0
-    n2 = n * n
-    v_num = n2 * s1 - n * s2 + 3 * s02
-    v_den = (n - 1) * (n + 1) * s02
 
-    Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
+    match params["mode"]:
+        case SpatialAutocorr.GEARY.s:
+            # Geary's C and Moran's I have different sampling variances under the
+            # normality assumption (Cliff & Ord 1981). Use the Geary's C variance
+            # (matching pysal/esda ``Geary``); reusing Moran's variance here gives a
+            # miscalibrated analytic p-value (see #1183).
+            Vscore_norm = ((2 * s1 + s2) * (n - 1) - 4 * s02) / (2 * (n + 1) * s02)
+        case SpatialAutocorr.MORAN.s:
+            # Moran's I normality variance (Cliff & Ord 1981; pysal/esda ``Moran``).
+            n2 = n * n
+            v_num = n2 * s1 - n * s2 + 3 * s02
+            v_den = (n - 1) * (n + 1) * s02
+            Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
+        case mode:
+            raise AssertionError(f"Unexpected mode `{mode}`.")
+
     seScore_norm = Vscore_norm ** (1 / 2.0)
 
     z_norm = (score - params["expected"]) / seScore_norm

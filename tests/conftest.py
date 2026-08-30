@@ -19,14 +19,13 @@ import pytest
 import scanpy as sc
 import spatialdata as sd
 from anndata import AnnData, OldFormatWarning
-from geopandas import GeoDataFrame
 from matplotlib.testing.compare import compare_images
 from scipy.sparse import csr_matrix
-from shapely import LineString, Point, Polygon, distance
+from shapely import Point, Polygon
 
 import squidpy as sq
 from squidpy._constants._pkg_constants import Key
-from squidpy.gr import spatial_neighbors
+from squidpy.gr import spatial_neighbors_grid
 from squidpy.im._container import ImageContainer
 
 HERE: Path = Path(__file__).parent
@@ -49,6 +48,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
     warnings.simplefilter("ignore", OldFormatWarning)
     sc.pl.set_rcParams_defaults()
+    sc.set_figure_params(dpi=40, color_map="viridis")
 
 
 @pytest.fixture(scope="session")
@@ -59,7 +59,7 @@ def adata_hne() -> AnnData:
 @pytest.fixture(scope="session")
 def adata_hne_concat() -> AnnData:
     adata1 = sq.datasets.visium_hne_adata_crop()
-    spatial_neighbors(adata1)
+    spatial_neighbors_grid(adata1)
     adata2 = adata1[:100, :].copy()
     adata2.uns["spatial"] = {}
     adata2.uns["spatial"]["V2_Adult_Mouse_Brain"] = adata1.uns["spatial"]["V1_Adult_Mouse_Brain"]
@@ -101,7 +101,7 @@ def nhood_data(adata: AnnData) -> AnnData:
     sc.pp.pca(adata)
     sc.pp.neighbors(adata)
     sc.tl.leiden(adata, key_added="leiden")
-    sq.gr.spatial_neighbors(adata)
+    sq.gr.spatial_neighbors_grid(adata)
 
     return adata
 
@@ -112,8 +112,65 @@ def dummy_adata() -> AnnData:
     adata = AnnData(r.rand(200, 100), obs={"cluster": r.randint(0, 3, 200)})
 
     adata.obsm[Key.obsm.spatial] = np.stack([r.randint(0, 500, 200), r.randint(0, 500, 200)], axis=1)
-    sq.gr.spatial_neighbors(adata, spatial_key=Key.obsm.spatial, n_rings=2)
+    sq.gr.spatial_neighbors_knn(adata, spatial_key=Key.obsm.spatial)
 
+    return adata
+
+
+@pytest.fixture()
+def dummy_adata2() -> AnnData:
+    r = np.random.RandomState(100)
+    adata = AnnData(r.rand(10, 100), obs={"celltype": r.choice(["foo", "bar", "baz"], size=10)})
+    adata.obs.index = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+
+    # Spatial layout of the 10 data points in the grid:
+    #
+    #   Y ▲
+    #     │
+    #   5 │       a    b         c    Points: (2,5), (3,5), (5,5)
+    #     │
+    #   4 │  d              e         Points: (1,4), (4,4)
+    #     │
+    #   3 │            f         g    Points: (3,3), (5,3)
+    #     │
+    #   2 │                 h         Points: (4,2)
+    #     │
+    #   1 │  i                   j    Points: (1,1), (5,1)
+    #     │
+    #     └─────────────────────────►
+    #        1    2    3    4    5   X
+    #
+    #
+    # celltypes-
+    # a      bar
+    # b      baz
+    # c      foo
+    # d      foo
+    # e      foo
+    # f      baz
+    # g      baz
+    # h      baz
+    # i      bar
+    # j      baz
+
+    adata.obsm["spatial"] = np.array(
+        [
+            [2, 5],
+            [3, 5],
+            [5, 5],
+            [1, 4],
+            [4, 4],
+            [3, 3],
+            [5, 3],
+            [4, 2],
+            [1, 1],
+            [5, 1],
+        ]
+    )
+
+    # using a radius of 1.5 will lead to, say e being a neighbor of b,c,f,g but not h. So all side-adjacent and diagonal-adjacent
+    # locations will be neighbors
+    sq.gr.spatial_neighbors_radius(adata, radius=1.5)
     return adata
 
 
@@ -162,7 +219,8 @@ def adata_squaregrid() -> AnnData:
 def paul15() -> AnnData:
     # session because we don't modify this dataset
     adata = sc.datasets.paul15()
-    sc.pp.normalize_per_cell(adata)
+    sc.pp.filter_cells(adata, min_counts=1)
+    sc.pp.normalize_total(adata)
     adata.raw = adata.copy()
 
     return adata
@@ -239,15 +297,6 @@ def cont_dot() -> ImageContainer:
 
 
 @pytest.fixture()
-def napari_cont() -> ImageContainer:
-    return ImageContainer(
-        "tests/_data/test_img.jpg",
-        layer="V1_Adult_Mouse_Brain",
-        library_id="V1_Adult_Mouse_Brain",
-    )
-
-
-@pytest.fixture()
 def interactions(adata: AnnData) -> tuple[Sequence[str], Sequence[str]]:
     return tuple(product(adata.raw.var_names[:5], adata.raw.var_names[:5]))  # type: ignore
 
@@ -265,10 +314,17 @@ def complexes(adata: AnnData) -> Sequence[tuple[str, str]]:
 
 
 @pytest.fixture(scope="session")
-def ligrec_no_numba() -> Mapping[str, pd.DataFrame]:
-    with open("tests/_data/ligrec_no_numba.pickle", "rb") as fin:
-        data = pickle.load(fin)
-        return {"means": data[0], "pvalues": data[1], "metadata": data[2]}
+def ligrec_pvalues_reference() -> Mapping[str, pd.DataFrame]:
+    # means/pvalues are cluster-pair x gene-pair matrices with a MultiIndex on both
+    # axes, stored as an AnnData (X=pvalues, layers["means"]=means) with the index
+    # levels kept as obs/var columns.
+    adata = ad.read_h5ad("tests/_data/ligrec_pvalues_reference.h5ad")
+    index = pd.MultiIndex.from_frame(adata.obs[["source", "target"]])
+    columns = pd.MultiIndex.from_frame(adata.var[["cluster_1", "cluster_2"]])
+    return {
+        "means": pd.DataFrame(adata.layers["means"], index=index, columns=columns),
+        "pvalues": pd.DataFrame(adata.X, index=index, columns=columns),
+    }
 
 
 @pytest.fixture(scope="session")
@@ -283,7 +339,7 @@ def ligrec_result() -> Mapping[str, pd.DataFrame]:
         n_jobs=1,
         show_progress_bar=False,
         copy=True,
-        seed=0,
+        rng=0,
     )
 
 
@@ -376,13 +432,18 @@ def sdata_mask_graph():
         "region_key": "region",
         "instance_key": "instance_id",
     }
-    return sd.SpatialData.from_elements_dict(
+    return sd.SpatialData.init_from_elements(
         {
             "circles": sd.models.ShapesModel().parse(points_df),
             "polygon": sd.models.ShapesModel().parse(polygon_df),
             "table": sd.models.TableModel().parse(adata),
         }
     )
+
+
+@pytest.fixture()
+def sdata_hne():
+    return sq.datasets.visium_hne_sdata()
 
 
 def _decorate(fn: Callable, clsname: str, name: str | None = None) -> Callable:
@@ -424,27 +485,25 @@ class PlotTester(ABC):
         plt.close()
 
         if tolerance is None:
-            # see https://github.com/scverse/squidpy/pull/302
-            tolerance = 2 * TOL if "Napari" in str(basename) else TOL
+            tolerance = TOL
 
         res = compare_images(str(EXPECTED / f"{basename}.png"), str(out_path), tolerance)
 
         assert res is None, res
 
 
-def pytest_addoption(parser):
-    parser.addoption("--test-napari", action="store_true", help="Test interactive image view")
+@pytest.fixture()
+def adjacency_matrix():
+    return np.array(
+        [
+            [0, 1, 1, 0],
+            [1, 0, 1, 0],
+            [1, 1, 0, 1],
+            [0, 0, 1, 0],
+        ]
+    )
 
 
-def pytest_collection_modifyitems(config, items):
-    if config.getoption("--test-napari"):
-        return
-    skip_slow = pytest.mark.skip(reason="Need --test-napari option to test interactive image view")
-    for item in items:
-        if "qt" in item.keywords:
-            item.add_marker(skip_slow)
-
-
-@pytest.fixture(scope="session")
-def _test_napari(pytestconfig):
-    _ = pytestconfig.getoption("--test-napari", skip=True)
+@pytest.fixture()
+def n_hop_matrix():
+    return np.array([[2, 1, 1, 1], [1, 2, 1, 1], [1, 1, 3, 0], [1, 1, 0, 1]])

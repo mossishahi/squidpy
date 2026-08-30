@@ -29,6 +29,10 @@ _ConnKey = Key.obsp.spatial_conn()
 _adata = """\
 adata
     Annotated data object."""
+_table_key = """\
+table_key
+    Key in :attr:`spatialdata.SpatialData.tables` where the table is stored. Required when ``adata`` is a
+    :class:`spatialdata.SpatialData` object and ignored otherwise."""
 _img_container = """\
 img
     High-resolution image."""
@@ -40,11 +44,27 @@ copy
     If ``True``, return the result, otherwise save it to the image container."""
 _numba_parallel = """\
 numba_parallel
-    Whether to use :class:`numba.prange` or not. If `None`, it is determined automatically.
+    Whether to use :func:`numba.prange` or not. If `None`, it is determined automatically.
     For small datasets or small number of interactions, it's recommended to set this to `False`."""
-_seed = """\
-seed
-    Random seed for reproducibility."""
+_rng = """\
+rng
+    Pseudorandom number generator state, following
+    `SPEC 7 <https://scientific-python.org/specs/spec-0007/>`_. When `None`, a new
+    :class:`numpy.random.Generator` is created using entropy from the operating system.
+    Types other than :class:`numpy.random.Generator` are passed to
+    :func:`numpy.random.default_rng` to instantiate a generator."""
+_seed_versionchanged = """\
+.. versionchanged:: 1.8.4
+    Every permutation now uses an independent :class:`numpy.random.Generator` spawned from a
+    :class:`numpy.random.SeedSequence`. Consequently the permutation-based results no
+    longer depend on ``n_jobs`` / ``backend``, but results obtained with a given seed
+    differ from those produced by squidpy < 1.8.4. See `#1232 <https://github.com/scverse/squidpy/issues/1232>`_ and
+    `#1233 <https://github.com/scverse/squidpy/issues/1233>`_."""
+_rng_versionchanged = """\
+.. versionchanged:: 1.8.4
+    ``seed`` / ``random_state`` were renamed to ``rng``, which also accepts a
+    :class:`numpy.random.Generator` (`SPEC 7 <https://scientific-python.org/specs/spec-0007/>`_).
+    The old names still work but emit a :class:`FutureWarning`."""
 _n_perms = """\
 n_perms
     Number of permutations for the permutation test."""
@@ -105,11 +125,40 @@ ax
 _plotting_returns = """\
 Nothing, just plots the figure and optionally saves the plot.
 """
-_parallelize = """\
+# Shared core-count rules, so the process-based ``n_jobs`` params document them once.
+_n_jobs_core_rules = """\
+    `None` is serial and ``-1`` uses all available cores; asking for more cores than are
+    available warns and falls back to all of them, while ``0`` and values below ``-1`` raise,
+    since :doc:`scanpy <scanpy:index>` only supports ``n_jobs >= -1``."""
+_parallelize = f"""\
 n_jobs
-    Number of parallel jobs.
+    Number of parallel jobs to use.
+{_n_jobs_core_rules}
+    For ``backend="loky"``, the number of cores used by numba for
+    each job spawned by the backend will be set to 1 in order to
+    overcome the oversubscription issue in case you run
+    numba in your function to parallelize.
+    To set the absolute maximum number of threads in numba
+    for your python program, set the environment variable:
+    ``NUMBA_NUM_THREADS`` before running the program.
 backend
     Parallelization backend to use. See :class:`joblib.Parallel` for available options.
+show_progress_bar
+    Whether to show the progress bar or not."""
+_n_jobs = f"""\
+n_jobs
+    Number of parallel jobs to use.
+{_n_jobs_core_rules}"""
+# Shared thread-count rules, so the thread-based ``n_jobs`` params document them once.
+_n_jobs_thread_rules = """\
+    `None` and ``-1`` use numba's default thread count (``NUMBA_NUM_THREADS``); asking for more
+    threads than that warns and falls back to it, while ``0`` and values below ``-1`` raise,
+    since :doc:`scanpy <scanpy:index>` only supports ``n_jobs >= -1``."""
+_n_jobs_threads = f"""\
+n_jobs
+    Number of parallel threads to use.
+{_n_jobs_thread_rules}"""
+_show_progress_bar = """\
 show_progress_bar
     Whether to show the progress bar or not."""
 _channels = """\
@@ -151,7 +200,7 @@ layer_added
     Layer of new image layer to add into ``img`` object."""
 _chunks_lazy = """\
 chunks
-    Number of chunks for :mod:`dask`. For automatic chunking, use ``chunks = 'auto'``.
+    Number of chunks for :doc:`dask:index`. For automatic chunking, use ``chunks = 'auto'``.
 lazy
     Whether to lazily compute the result or not. Only used when ``chunks != None``."""
 
@@ -184,12 +233,40 @@ _library_key = """\
 library_key
     Key in :attr:`anndata.AnnData.obs` containing library ids for which to build the spatial graphs separately."""
 
+# niche docs
+_niche_spatial_conn_key = """\
+spatial_connectivities_key
+    Key in :attr:`anndata.AnnData.obsp` containing the spatial connectivity matrix."""
+_niche_mask = """\
+mask
+    Boolean :class:`pandas.Series` indexed like :attr:`anndata.AnnData.obs`. Observations that
+    are `False` are excluded from niche assignment and labeled ``'not_a_niche'``, e.g.
+    ``Series([False, False, True], index=["a", "b", "c"])``."""
+_niche_min_niche_size = """\
+min_niche_size
+    Minimum number of observations required for a niche. Niches with fewer observations
+    are relabeled ``'not_a_niche'``."""
+# the postprocessing + output params every user-facing niche function shares, in signature order
+_niche_common_params = f"""\
+{_niche_min_niche_size}
+{_niche_mask}
+{_library_key}
+{_copy}"""
+_niche_leiden_params = f"""\
+flavor
+    Leiden backend passed to :func:`scanpy.tl.leiden`. Defaults to ``'igraph'``
+    (the ``'leidenalg'`` backend is deprecated in scanpy).
+n_iterations
+    Number of Leiden iterations. ``-1`` iterates until convergence.
+{_rng}
+    Every resolution is clustered with an independent rng derived from it."""
+
 # static plotting docs
 _plotting_kwargs_static = """\
 scalebar_kwargs
-    Keyword arguments for :meth:`matplotlib_scalebar.ScaleBar`.
+    Keyword arguments for :class:`matplotlib_scalebar.ScaleBar`.
 edges_kwargs
-    Keyword arguments for :func:`networkx.draw_networkx_edges`.
+    Keyword arguments for :func:`networkx.drawing.nx_pylab.draw_networkx_edges` :cite:`networkx`.
 kwargs
     Keyword arguments for :func:`matplotlib.pyplot.scatter` or :func:`matplotlib.pyplot.imshow`.
 """
@@ -352,13 +429,52 @@ library_key
     If multiple `library_id`, column in :attr:`anndata.AnnData.obs`
     which stores mapping between ``library_id`` and obs."""
 
+_sdata_params = """\
+elements_to_coordinate_systems
+    A dictionary mapping element names of the SpatialData object to coordinate systems.
+    The elements can be either Shapes or Labels. For compatibility, the spatialdata table must annotate
+    all regions keys. Must not be ``None`` if ``adata`` is a :class:`spatialdata.SpatialData`.
+table_key
+    Key in :attr:`spatialdata.SpatialData.tables` where the spatialdata table is stored. Must not be ``None`` if
+    ``adata`` is a :class:`spatialdata.SpatialData`."""
+_graph_common_params = """\
+percentile
+    Percentile of the distances to use as threshold.
+transform
+    Adjacency matrix transform (``'spectral'``, ``'cosine'``, or ``None``).
+set_diag
+    Whether to set the diagonal of the connectivities to ``1.0``.
+key_added
+    Key which controls where the results are saved if ``copy = False``."""
+_n_jobs_libraries = f"""\
+n_jobs
+    Number of parallel jobs used to build the per-library graphs when ``library_key``
+    is set. Each library's graph is computed independently, so this only has an effect
+    for multi-library data. ``1`` (default) builds the graphs sequentially and does not
+    change behavior, and it has no effect when ``library_key`` is ``None``.
+{_n_jobs_thread_rules}
+    Speedup is sub-linear (memory-bandwidth bound), so parallelism mainly pays off for many
+    large libraries."""
+_spatial_neighbors_returns = """\
+If ``copy = True``, returns a :class:`~squidpy.gr.SpatialNeighborsResult` with the
+spatial connectivities and distances matrices.
+
+Otherwise, modifies the ``adata`` with the following keys:
+
+    - :attr:`anndata.AnnData.obsp` ``['{key_added}_connectivities']`` - the spatial connectivities.
+    - :attr:`anndata.AnnData.obsp` ``['{key_added}_distances']`` - the spatial distances.
+    - :attr:`anndata.AnnData.uns`  ``['{key_added}']`` - :class:`dict` containing parameters."""
+
 d = DocstringProcessor(
     adata=_adata,
+    table_key=_table_key,
     img_container=_img_container,
     copy=_copy,
     copy_cont=_copy_cont,
     numba_parallel=_numba_parallel,
-    seed=_seed,
+    rng=_rng,
+    seed_versionchanged=_seed_versionchanged,
+    rng_versionchanged=_rng_versionchanged,
     n_perms=_n_perms,
     img_layer=_img_layer,
     feature_name=_feature_name,
@@ -372,6 +488,9 @@ d = DocstringProcessor(
     cat_plotting=_cat_plotting,
     plotting_returns=_plotting_returns,
     parallelize=_parallelize,
+    n_jobs=_n_jobs,
+    n_jobs_threads=_n_jobs_threads,
+    show_progress_bar=_show_progress_bar,
     channels=_channels,
     segment_kwargs=_segment_kwargs,
     ligrec_test_returns=_ligrec_test_returns,
@@ -394,4 +513,13 @@ d = DocstringProcessor(
     groups=_groups,
     plotting_library_id=_plotting_library_id,
     library_key=_library_key,
+    niche_spatial_conn_key=_niche_spatial_conn_key,
+    niche_mask=_niche_mask,
+    niche_min_niche_size=_niche_min_niche_size,
+    niche_common_params=_niche_common_params,
+    niche_leiden_params=_niche_leiden_params,
+    sdata_params=_sdata_params,
+    graph_common_params=_graph_common_params,
+    n_jobs_libraries=_n_jobs_libraries,
+    spatial_neighbors_returns=_spatial_neighbors_returns,
 )
